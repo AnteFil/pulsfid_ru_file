@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+Объединенный скрипт для парсинга новостей Google и загрузки изображений с Yandex.
+Сначала выполняется парсинг новостей, при успехе - загрузка изображений.
+Отправляет все данные одним запросом на сервер.
+
+Особенности для Windows:
+- Скрипт готов к сборке в .exe через PyInstaller.
+- Ищет config.json рядом с .exe файлом.
+- Логирование в файлы, что удобно при запуске без консоли.
+"""
+
+import json
+import time
+import sys
+from pathlib import Path
+from urllib.parse import quote_plus, urlsplit, parse_qs, unquote
+import logging
+from logging.handlers import RotatingFileHandler
+
+import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException
+import os
+import tempfile
+import re
+import uuid
+import mimetypes
+import shutil
+import urllib.parse
+
+from urllib.parse import urlencode, urlparse, parse_qs, unquote, quote_plus
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+
+
+# ----------------- Глобальные настройки -----------------
+def get_chrome_options():
+    opts = Options()
+    # opts.add_argument("--headless=new")  # Раскомментируйте для фонового режима
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-features=RendererCodeIntegrity")
+    # Добавляем таймаут на уровне Chrome (в миллисекундах)
+    opts.add_argument("--timeout=20000")  # 20 секунд
+    user_data_dir = Path(tempfile.gettempdir()) / f"chrome_user_data_{os.getpid()}"
+    user_data_dir.mkdir(exist_ok=True)
+    opts.add_argument(f"--user-data-dir={str(user_data_dir)}")
+    opts.add_argument("--enable-logging")
+    opts.add_argument("--v=1")
+    return opts
+
+
+# ----------------- Настройка логирования -----------------
+BRIEF_DEFAULT = "run_brief.log"
+DETAILED_DEFAULT = "parser_detailed.log"
+
+
+def setup_logging(brief_log_path: str = BRIEF_DEFAULT, detailed_log_path: str = DETAILED_DEFAULT,
+                  console: bool = False):
+    brief = logging.getLogger("brief")
+    brief.setLevel(logging.INFO)
+    for h in list(brief.handlers): brief.removeHandler(h)
+    bh = RotatingFileHandler(brief_log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    bh.setFormatter(logging.Formatter("%(asctime)s - %(message)s", "%Y-%m-%d %H:%M:%S"))
+    brief.addHandler(bh)
+    brief.propagate = False
+
+    detailed = logging.getLogger("detailed")
+    detailed.setLevel(logging.DEBUG)
+    for h in list(detailed.handlers): detailed.removeHandler(h)
+    dh = RotatingFileHandler(detailed_log_path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    dh.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(funcName)s - %(message)s", "%Y-%m-%d %H:%M:%S"))
+    detailed.addHandler(dh)
+    if console:
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(dh.formatter)
+        detailed.addHandler(ch)
+    detailed.propagate = False
+    detailed.debug("Logging initialized. brief=%s detailed=%s console=%s", brief_log_path, detailed_log_path, console)
+    return brief, detailed
+
+
+brief_logger, detailed_logger = setup_logging()
+
+
+# ----------------- Утилиты -----------------
+def possible_config_paths(config_name="config.json"):
+    candidates = []
+    try:
+        candidates.append(Path(sys.executable).resolve().parent / config_name)
+    except Exception:
+        pass
+    try:
+        candidates.append(Path.cwd().resolve() / config_name)
+    except Exception:
+        pass
+    try:
+        candidates.append(Path(__file__).resolve().parent / config_name)
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        try:
+            candidates.append(Path(sys._MEIPASS) / config_name)
+        except Exception:
+            pass
+
+    seen = set()
+    uniq = []
+    for p in candidates:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    logging.getLogger("detailed").debug("Config search paths: %s", uniq)
+    return uniq
+
+
+def load_config(config_name="config.json"):
+    logger = logging.getLogger("detailed")
+    paths = possible_config_paths(config_name)
+    for p in paths:
+        if p.exists() and p.is_file():
+            try:
+                txt = p.read_text(encoding="utf-8")
+                cfg = json.loads(txt)
+                logger.info("Loaded config from: %s", p)
+                return cfg
+            except Exception as e:
+                logger.error("Error reading/parsing %s: %s", p, e)
+    raise FileNotFoundError(f"Config file '{config_name}' not found in any of the standard locations.")
+
+
+def ensure_dir_exists(path):
+    """Убедиться, что директория существует, создать если нет."""
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+# --- Функции для парсинга новостей ---
+def api_get_keyword(api_get_keyword_url: str, token: str):
+    logger = logging.getLogger("detailed")
+    try:
+        r = requests.get(api_get_keyword_url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return data[0] if isinstance(data, list) else data
+    except Exception as e:
+        logger.error("Failed to get keyword: %s", e, exc_info=True)
+        return None
+
+
+def build_google_news_url(keyword: str, period: str = "d") -> str:
+    """
+    Создает URL для поиска новостей Google.
+
+    Args:
+        keyword: Ключевое слово для поиска
+        period: Период поиска ('d' - день, 'w' - неделя)
+
+    Returns:
+        URL для поиска новостей Google
+    """
+    q = quote_plus(keyword)
+    return f"https://www.google.com/search?q={q}&tbs=qdr:{period}&tbm=nws&hl=ru&gl=RU"
+
+
+def extract_news_from_page(driver):
+    logger = logging.getLogger("detailed")
+    items = []
+    seen = set()
+    clusters = driver.find_elements("css selector", 'div[data-news-cluster-id]')
+    if not clusters:
+        clusters = driver.find_elements("css selector", 'div.SoaBEf div[data-news-cluster-id], div.SoaBEf')
+    logger.debug("Found %s news clusters", len(clusters))
+    for el in clusters:
+        try:
+            title_element = el.find_element("css selector", "div.n0jPhd")
+            title = title_element.text.strip()
+            description = el.find_element("css selector", "div.GI74Re").text.strip()
+
+            # Извлекаем URL из заголовка
+            url = ""
+            try:
+                # Пытаемся получить ссылку из заголовка
+                link_element = title_element.find_element(By.XPATH, "./ancestor::a")
+                url = link_element.get_attribute("href") or ""
+            except Exception:
+                # Альтернативный способ получить URL
+                try:
+                    link_element = el.find_element(By.CSS_SELECTOR, "a")
+                    url = link_element.get_attribute("href") or ""
+                except Exception:
+                    pass
+
+            key = f"{title}|{description}"
+            if key not in seen:
+                seen.add(key)
+                items.append({
+                    "title": title,
+                    "description": description,
+                    "url": url
+                })
+        except Exception as e:
+            logger.debug(f"Error extracting news item: {e}")
+            continue
+    logger.info("Extracted %s news items", len(items))
+    return items
+
+
+# --- Функции для загрузки изображений ---
+def build_yandex_url(keyword):
+    base = "https://yandex.ru/images/search"
+    params = {"from": "tabbar", "text": keyword, "iorient": "horizontal", "recent": "7D", 'type': 'photo'}
+    return f"{base}?{urlencode(params, quote_via=quote_plus)}"
+
+
+def collect_image_urls_from_element(a_elem, driver):
+    urls = []
+    try:
+        href = a_elem.get_attribute("href") or ""
+        parsed = urlparse(href)
+        qs = parse_qs(parsed.query)
+        if "img_url" in qs: urls.append(unquote(qs["img_url"][0]))
+    except Exception:
+        pass
+
+    try:
+        img = a_elem.find_element(By.CSS_SELECTOR, "img")
+        for attr in ("src", "data-src"):
+            if img.get_attribute(attr): urls.append(img.get_attribute(attr))
+    except Exception:
+        pass
+
+    return list(dict.fromkeys([u if u.startswith("http") else f"https:{u}" for u in urls if u]))
+
+
+def download_file_stream(url, dest_path, timeout=25):
+    logger = logging.getLogger("detailed")
+    headers = {"User-Agent": "Mozilla/5.0...", "Referer": "https://yandex.ru/"}
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(8192): f.write(chunk)
+        return True
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout downloading {url}: No response within {timeout} seconds.")
+        return False
+    except Exception as e:
+        logger.error(f"Error downloading {url}: {e}")
+        return False
+
+
+def detect_image_mime_and_ext(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+        if head.startswith(b"\xff\xd8\xff"): return "image/jpeg", ".jpg"
+        if head.startswith(b"\x89PNG\r\n\x1a\n"): return "image/png", ".png"
+        if head[:6] in (b"GIF87a", b"GIF89a"): return "image/gif", ".gif"
+        if head[:4] == b"RIFF":
+            with open(path, "rb") as f:
+                if b"WEBP" in f.read(64)[8:16]: return "image/webp", ".webp"
+    except Exception:
+        pass
+    return None, None
+
+
+# --- Новые функции для извлечения текста со страниц ---
+def fetch_html_requests(url: str, timeout: int = 20) -> str:
+    logger = logging.getLogger("detailed")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        # корректируем encoding для кириллицы
+        r.encoding = r.apparent_encoding
+        return r.text
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout for {url}: No response within {timeout} seconds")
+        return ""
+    except Exception as e:
+        logger.error(f"Requests error for {url}: {e}")
+        return ""
+
+
+def fetch_html_selenium(url: str, driver, wait: float = 2.0, timeout: int = 20) -> str:
+    logger = logging.getLogger("detailed")
+    try:
+        driver.set_page_load_timeout(timeout)
+        driver.get(url)
+        # короткая пауза для рендеринга JS
+        time.sleep(wait)
+        html = driver.page_source
+        return html
+    except TimeoutException:
+        logger.error(f"Selenium timeout for {url}: Page did not load within {timeout} seconds")
+        return ""
+    except Exception as e:
+        logger.error(f"Selenium error for {url}: {e}")
+        return ""
+
+
+def extract_text_from_html(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    # Удаляем скрипты и стили
+    for script in soup(["script", "style"]):
+        script.extract()
+
+    # Извлекаем текст из основных тегов
+    text_parts = []
+
+    # Заголовки
+    for tag in ["h1", "h2"]:
+        for element in soup.find_all(tag):
+            text = element.get_text(separator=" ", strip=True)
+            if text:
+                text_parts.append(f"{'#' * int(tag[1])} {text}")
+
+    # Параграфы
+    for element in soup.find_all("p"):
+        text = element.get_text(separator=" ", strip=True)
+        if text:
+            text_parts.append(text)
+
+    # Статьи и основные секции
+    for tag in ["article", "main", "section"]:
+        for element in soup.find_all(tag):
+            text = element.get_text(separator=" ", strip=True)
+            if text and len(text) > 100:  # Только значительные блоки текста
+                text_parts.append(text)
+
+    return "\n\n".join(text_parts)
+
+
+def extract_article_text(url: str, driver=None, use_selenium_fallback: bool = True) -> str:
+    logger = logging.getLogger("detailed")
+    logger.info(f"Extracting text from: {url}")
+
+    # Сначала пробуем requests
+    html = fetch_html_requests(url)
+    text = ""
+
+    if html:
+        text = extract_text_from_html(html)
+        logger.info(f"Extracted text via requests, length: {len(text)}")
+
+    # Если текста мало или нет, пробуем Selenium
+    if (not text or len(text) < 200) and use_selenium_fallback and driver:
+        logger.info("Requests gave too little text - trying Selenium fallback...")
+        html2 = fetch_html_selenium(url, driver)
+        if html2:
+            text2 = extract_text_from_html(html2)
+            if len(text2) > len(text):
+                text = text2
+                logger.info(f"Extracted text via Selenium, length: {len(text)}")
+
+    return text
+
+
+def extract_full_text_for_news(news_items, driver=None, max_articles: int = 5):
+    logger = logging.getLogger("detailed")
+    logger.info(f"Extracting full text for up to {max_articles} articles")
+
+    # Ограничиваем количество статей для обработки
+    items_to_process = news_items[:max_articles]
+
+    for i, item in enumerate(items_to_process):
+        url = item.get("url", "")
+        if not url:
+            logger.warning(f"No URL for article {i + 1}: {item.get('title', '')}")
+            continue
+
+        try:
+            # Извлекаем полный текст статьи
+            full_text = extract_article_text(url, driver, use_selenium_fallback=True)
+            item["full_text"] = full_text
+            logger.info(f"Extracted {len(full_text)} characters for article {i + 1}")
+        except Exception as e:
+            logger.error(f"Error extracting text for article {i + 1}: {e}")
+            item["full_text"] = ""
+
+    return news_items
+
+
+# --- ИЗМЕНЕННАЯ функция для отправки данных на сервер ---
+def api_post_combined_results(api_post_url: str, token: str, keyword_uuid: str, news_items, image_paths):
+    logger = logging.getLogger("detailed")
+    if not news_items:
+        logger.error("Cannot post results: news_items list is empty.")
+        return False, None
+
+    try:
+        # --- ИСПРАВЛЕННАЯ подготовка данных для отправки ---
+        # Laravel ожидает массив в формате items[0][key], items[1][key] и т.д.
+        data = {
+            "keyword_uuid": keyword_uuid
+        }
+
+        # Логируем информацию о данных перед отправкой
+        logger.info(f"Preparing to send {len(news_items)} news items")
+
+        for i, item in enumerate(news_items):
+            data[f"items[{i}][title]"] = item.get('title', '')
+            data[f"items[{i}][description]"] = item.get('description', '')
+            data[f"items[{i}][url]"] = item.get('url', '')
+
+            # ИСПРАВЛЕНО: обрезаем текст до 5000 символов перед отправкой
+            full_text = item.get('full_text', '')
+            if len(full_text) > 25000:
+                truncated_text = full_text[:25000]
+                logger.warning(f"Text for item {i + 1} was truncated from {len(full_text)} to 25000 characters.")
+                data[f"items[{i}][text]"] = truncated_text
+            else:
+                data[f"items[{i}][text]"] = full_text
+
+            # Логируем информацию о каждом элементе
+            logger.info(
+                f"Item {i + 1}: Title='{item.get('title', '')[:50]}...', Text length={len(data[f'items[{i}][text]'])}")
+
+        # Подготовка файлов для отправки
+        files = {}
+        for i, path in enumerate(image_paths):
+            if os.path.exists(path):
+                mime, _ = detect_image_mime_and_ext(path) or mimetypes.guess_type(path) or (
+                    "application/octet-stream", None)
+                files[f"attachments[{i}]"] = (os.path.basename(path), open(path, "rb"), mime)
+
+        logger.info("Sending request to API URL: %s", api_post_url)
+        logger.info("Sending %d news items and %d files.", len(news_items), len(files))
+
+        # Отправка запроса
+        r = requests.post(
+            api_post_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json"
+            },
+            data=data,
+            files=files,
+            timeout=120
+        )
+
+        # Закрытие файлов
+        for file_obj in files.values():
+            file_obj[1].close()
+
+        # --- КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ ---
+        logger.info("API Response Status: %s", r.status_code)
+        response_preview = r.text[:200] + "..." if len(r.text) > 200 else r.text
+        logger.info("API Response Preview: %s", response_preview)
+
+        # Проверяем, что ответ в формате JSON
+        try:
+            response_json = r.json()
+        except json.JSONDecodeError:
+            logger.error("API response is not valid JSON. Received HTML or other format.")
+            return False, r
+
+        # Определяем успех на основе статуса и содержимого ответа
+        if r.status_code == 201 and 'message' in response_json and 'сохранены' in response_json['message']:
+            # Проверяем, что сервер подтвердил получение текста
+            if 'inserted_searches' in response_json:
+                for search in response_json['inserted_searches']:
+                    if 'text_length' in search:
+                        logger.info(f"Server confirmed text length: {search['text_length']}")
+
+            return True, r
+        elif r.status_code == 200:
+            logger.warning("Server returned a 200 status, but operation might not be a success. Message: %s",
+                           response_json.get('message'))
+            return False, r
+        else:
+            logger.error("API returned an error status: %s. Message: %s", r.status_code, response_json.get('message'))
+            return False, r
+
+    except Exception as e:
+        logger.error("Failed to post combined results: %s", e, exc_info=True)
+        return False, None
+
+
+# --- НОВАЯ функция для очистки временных файлов ---
+def cleanup_temp_files(temp_dir: Path):
+    """Удаляет временную директорию со всем содержимым."""
+    logger = logging.getLogger("detailed")
+    try:
+        if temp_dir.exists() and temp_dir.is_dir():
+            shutil.rmtree(temp_dir)
+            logger.info(f"Successfully removed temporary directory: {temp_dir}")
+    except Exception as e:
+        logger.error(f"Failed to remove temporary directory {temp_dir}: {e}")
+
+
+# --- Основная функция выполнения ---
+def run_combined_parser(cfg, keyword_uuid, keyword_title):
+    brief = logging.getLogger("brief")
+    detailed = logging.getLogger("detailed")
+    brief.info("Starting combined parser for keyword: %s", keyword_title)
+    detailed.info("run_combined_parser started")
+
+    CHROME_BINARY = cfg.get("CHROME_BINARY")
+    CHROMEDRIVER_PATH = cfg.get("CHROMEDRIVER_PATH")
+    API_POST_RESULTS = cfg.get("API_POST_RESULTS")
+    TOKEN = cfg.get("TOKEN")
+    IMAGES_DIR = cfg.get("IMAGES_DIR", "images")
+    OUT_JSON = cfg.get("OUT_JSON", "results.json")
+    OUT_HTML = cfg.get("OUT_HTML", "page_dump.html")
+    OUT_SCREEN = cfg.get("OUT_SCREEN", "screenshot.png")
+    MAX_ARTICLES_TO_PROCESS = cfg.get("MAX_ARTICLES_TO_PROCESS", 5)
+    PAGE_LOAD_TIMEOUT = cfg.get("PAGE_LOAD_TIMEOUT", 20)  # Новый параметр
+
+    if not Path(CHROME_BINARY).exists():
+        detailed.error("Chrome binary not found at: %s", CHROME_BINARY)
+        brief.error("Chrome binary not found. Aborting.")
+        return False
+
+    if not Path(CHROMEDRIVER_PATH).exists():
+        detailed.error("Chromedriver not found at: %s", CHROMEDRIVER_PATH)
+        brief.error("Chromedriver not found. Aborting.")
+        return False
+
+    # Создаем основную директорию для изображений, если она не существует
+    ensure_dir_exists(IMAGES_DIR)
+
+    # ГЕНЕРИРУЕМ УНИКАЛЬНЫЙ ИДЕНТИФИКАТОР ДЛЯ ЗАПУСКА
+    run_id = str(uuid.uuid4())[:8]  # Короткий UUID для удобства
+    temp_images_dir = Path(IMAGES_DIR) / f"temp_{run_id}"
+    ensure_dir_exists(temp_images_dir)
+    detailed.info(f"Created temporary directory for images: {temp_images_dir}")
+
+    opts = get_chrome_options()
+    if CHROME_BINARY: opts.binary_location = CHROME_BINARY
+
+    driver = webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=opts)
+    # Устанавливаем таймаут для всех последующих загрузок страниц
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+
+    news_items = []
+    image_paths = []
+    success = False
+
+    try:
+        # Этап 1: Парсинг новостей с обработкой таймаута
+        try:
+            # Сначала пробуем поиск за день
+            driver.get(build_google_news_url(keyword_title, "d"))
+            time.sleep(3)
+            Path(OUT_HTML).write_text(driver.page_source, encoding="utf-8")
+            driver.save_screenshot(OUT_SCREEN)
+            news_items = extract_news_from_page(driver)
+
+            # Если новостей мало (меньше 2), пробуем поиск за неделю
+            if len(news_items) < 2:
+                brief.info(f"Found only {len(news_items)} news for the day. Trying weekly search...")
+                detailed.info(f"Switching to weekly search due to insufficient results")
+
+                driver.get(build_google_news_url(keyword_title, "w"))
+                time.sleep(3)
+                Path(OUT_HTML).write_text(driver.page_source, encoding="utf-8")
+                driver.save_screenshot(OUT_SCREEN)
+                news_items = extract_news_from_page(driver)
+
+                brief.info(f"Found {len(news_items)} news for the week")
+                detailed.info(f"Weekly search returned {len(news_items)} news items")
+
+        except TimeoutException:
+            brief.error(f"Timeout loading Google News page after {PAGE_LOAD_TIMEOUT} seconds.")
+            detailed.error(f"TimeoutException for Google News URL: {build_google_news_url(keyword_title)}")
+            return False  # Без новостей продолжать нет смысла
+        except Exception as e:
+            brief.error(f"Error loading Google News page: {e}")
+            detailed.exception(f"Error during Google News phase: {e}")
+            return False
+
+        # Этап 1.5: Извлечение полного текста новостей
+        if news_items:
+            brief.info(f"Extracting full text for {min(len(news_items), MAX_ARTICLES_TO_PROCESS)} articles")
+            news_items = extract_full_text_for_news(news_items, driver, MAX_ARTICLES_TO_PROCESS)
+
+        # Этап 2: Загрузка изображений с обработкой таймаута
+        try:
+            driver.get(build_yandex_url(keyword_title))
+            for _ in range(4):
+                driver.execute_script("window.scrollBy(0, window.innerHeight);")
+                time.sleep(0.8)
+
+            wait = WebDriverWait(driver, 15)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.ImagesContentImage-Cover")))
+            anchors = driver.find_elements(By.CSS_SELECTOR, "a.ImagesContentImage-Cover")
+
+            for idx, a in enumerate(anchors):
+                if len(image_paths) >= 3: break
+                try:
+                    for cnum, url in enumerate(collect_image_urls_from_element(a, driver)):
+                        # ИЗМЕНЕНО: используем уникальное имя файла с run_id
+                        dest = temp_images_dir / f"img_{run_id}_{idx}_{cnum}.jpg"
+                        if download_file_stream(url, dest):
+                            if detect_image_mime_and_ext(dest)[0]:
+                                image_paths.append(str(dest))
+                                break
+                            else:
+                                os.remove(dest)
+                except Exception:
+                    continue
+        except TimeoutException:
+            brief.error(f"Timeout loading Yandex Images page after {PAGE_LOAD_TIMEOUT} seconds. Skipping images.")
+            detailed.error(f"TimeoutException for Yandex Images URL: {build_yandex_url(keyword_title)}")
+        except Exception as e:
+            brief.error(f"Error loading Yandex Images page: {e}. Skipping images.")
+            detailed.exception(f"Error during Yandex Images phase: {e}")
+            # Продолжаем выполнение, даже если изображения не загружены
+
+        # Этап 3: Отправка данных на сервер
+        post_success, resp = api_post_combined_results(API_POST_RESULTS, TOKEN, keyword_uuid, news_items, image_paths)
+        if post_success:
+            success = True
+            brief.info("Combined parsing and API post successful.")
+        else:
+            brief.error("API post failed. Check detailed log for server response.")
+
+        out_full = {
+            "keyword_uuid": keyword_uuid,
+            "keyword_title": keyword_title,
+            "news_items": news_items,
+            "image_paths": image_paths
+        }
+        Path(OUT_JSON).write_text(json.dumps(out_full, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    except Exception as e:
+        detailed.exception("Error during combined parsing: %s", e)
+        brief.error("Combined parsing failed with an error.")
+    finally:
+        # --- ГАРАНТИРОВАННАЯ ОЧИСТКА ---
+        # Этот блок выполнится всегда, даже если в 'try' была ошибка или 'return'
+        detailed.info("Cleaning up temporary files...")
+        cleanup_temp_files(temp_images_dir)
+        driver.quit()
+
+    detailed.info("run_combined_parser finished with success=%s", success)
+    return success
+
+
+# ----------------- Main -----------------
+def main():
+    start_ts = time.time()
+    # Инициализируем логгеры как можно раньше
+    brief = logging.getLogger("brief")
+    detailed = logging.getLogger("detailed")
+
+    # Выводим в консоль, чтобы было видно, что скрипт вообще стартует
+    print("===== SCRIPT START =====")
+    brief.info("===== SCRIPT START =====")
+    detailed.info("main started")
+
+    try:
+        print("Loading config...")
+        cfg = load_config()
+        print("Config loaded successfully.")
+
+        # Установка логирования из конфига
+        setup_logging(cfg.get("BRIEF_LOG"), cfg.get("DETAILED_LOG"), bool(cfg.get("LOG_TO_CONSOLE")))
+        print("Logging configured.")
+
+        print("Getting keyword from API...")
+        kw_obj = api_get_keyword(cfg.get("API_GET_KEYWORD"), cfg.get("TOKEN"))
+        if not kw_obj:
+            print("ERROR: FINISH: Could not obtain keyword from API.")
+            brief.error("FINISH: Could not obtain keyword from API.")
+            return
+
+        keyword_uuid = kw_obj.get("uuid") or kw_obj.get("id")
+        keyword_title = kw_obj.get("title") or kw_obj.get("keyword")
+        if not keyword_uuid or not keyword_title:
+            print("ERROR: FINISH: Invalid keyword object received from API.")
+            brief.error("FINISH: Invalid keyword object received from API.")
+            return
+
+        print(f"Starting parser for keyword: {keyword_title}")
+        run_combined_parser(cfg, keyword_uuid, keyword_title)
+
+    except FileNotFoundError as e:
+        print(f"FATAL ERROR: {e}")
+        detailed.exception(f"Config file not found: {e}")
+    except Exception as e:
+        print(f"FATAL ERROR: An unhandled exception occurred: {e}")
+        detailed.exception("Unhandled top-level exception: %s", e)
+        brief.error("FINISH: Script terminated by an unhandled exception.")
+    finally:
+        duration = time.time() - start_ts
+        detailed.info("Script finished. Duration: %.2f seconds", duration)
+        brief.info("===== SCRIPT FINISH (duration=%.2f s) =====", duration)
+        print(f"===== SCRIPT FINISH (duration={duration:.2f} s) =====")
+
+
+if __name__ == "__main__":
+    main()
