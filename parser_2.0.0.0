@@ -1,0 +1,671 @@
+import os
+import re
+import time
+import requests
+import json
+import uuid
+from urllib.parse import urlparse, quote_plus
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# --- НАСТРОЙКИ ---
+
+# Путь к вашим файлам
+chromedriver_path = "driver\\chromedriver.exe"
+chrome_path = "chrome\\chrome.exe"
+# Папка output_folder теперь будет создаваться динамически ниже
+
+# Количество страниц Google для парсинга (1 или 2)
+GOOGLE_PAGES_TO_PARSE = 1
+
+# URL для поиска (шаблон)
+url_template = "https://www.google.com/search?q={keyword}&tbs=qdr:d&tbm=nws&hl=ru&gl=RU"
+
+# --- НАСТРОЙКИ API СУММАРИЗАЦИИ---
+API_URL = "https://bbfil.ru/deepseek_sum.php"
+API_KEY = "or-v1a01962d55218e043287c3346491"
+API_HEADERS = {
+    'Content-Type': 'application/json',
+    'X-API-Key': API_KEY
+}
+
+# --- НОВЫЕ НАСТРОЙКИ API ---
+API_GET_KEYWORD = "https://pulsfid.ru/api/get/empty/one/keyword"
+API_POST_RESULTS = "https://pulsfid.ru/api/add/searches/with-attachments"
+TOKEN = "1|rlGA9DvSwMkPYK2uA8wKNx42BssDKk3hoJn4Kd8H0f5e0ead"
+
+# --- НАСТРОЙКИ OPENROUTER API ---
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = "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"  # Замените на ваш ключ API
+OPENROUTER_HEADERS = {
+    'Content-Type': 'application/json',
+    'Authorization': f'Bearer {OPENROUTER_API_KEY}'
+}
+
+# Максимальное количество попыток отправки запроса
+MAX_RETRIES = 3
+# Начальный таймаут в секундах
+INITIAL_TIMEOUT = 300  # Увеличили с 240 до 300 секунд (5 минут)
+
+
+# --- ФУНКЦИИ ---
+def get_keyword_from_api():
+    """
+    Получает ключевое слово и UUID из API
+    """
+    print("\n📤 Получение ключевого слова из API...")
+
+    headers = {
+        'Authorization': f'Bearer {TOKEN}'
+    }
+
+    try:
+        response = requests.get(API_GET_KEYWORD, headers=headers, timeout=30)
+
+        if response.status_code == 200:
+            response_data = response.json()
+            keyword = response_data.get('title', '')
+            keyword_uuid = response_data.get('uuid', '')
+
+            if keyword and keyword_uuid:
+                print(f"✅ Получено ключевое слово: {keyword}")
+                print(f"✅ Получен UUID: {keyword_uuid}")
+                return keyword, keyword_uuid
+            else:
+                print("❌ В ответе API отсутствуют поля 'title' или 'uuid'")
+                return None, None
+        else:
+            print(f"❌ Ошибка при запросе к API: {response.status_code}")
+            print(f"Ответ: {response.text}")
+            return None, None
+
+    except Exception as e:
+        print(f"❌ Исключение при запросе к API: {e}")
+        return None, None
+
+
+def clean_text_for_json(text):
+    # Удаляем управляющие символы, кроме \t, \n, \r
+    return ''.join(char for char in text if char.isprintable() or char in '\t\n\r')
+
+
+def send_request_with_retries(url, payload, headers, max_retries=MAX_RETRIES, initial_timeout=INITIAL_TIMEOUT):
+    """
+    Отправляет запрос с несколькими попытками и увеличивающимся таймаутом
+    """
+    for attempt in range(max_retries):
+        try:
+            # Увеличиваем таймаут с каждой попыткой
+            current_timeout = initial_timeout * (attempt + 1)
+            print(f"Попытка {attempt + 1}/{max_retries}, таймаут: {current_timeout} секунд")
+
+            response = requests.post(url, json=payload, headers=headers, timeout=current_timeout)
+            print(f"Статус-код ответа: {response.status_code}")
+
+            # Проверяем статус ответа
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except ValueError as e:
+                    print(f"Ошибка парсинга JSON: {e}")
+                    print(f"Содержимое ответа: {response.text[:500]}...")  # Выводим первые 500 символов ответа
+                    if attempt < max_retries - 1:
+                        print("Повторная попытка через 20 секунд...")
+                        time.sleep(10)
+                        continue
+                    else:
+                        raise
+            elif response.status_code in [504, 502, 503]:  # Ошибки шлюза, которые могут быть временными
+                print(f"Ошибка сервера {response.status_code}, повторная попытка...")
+                if attempt < max_retries - 1:
+                    time.sleep(15)  # Ждем 15 секунд перед повторной попыткой
+                    continue
+                else:
+                    raise Exception(f"Сервер вернул ошибку {response.status_code} после {max_retries} попыток")
+            else:
+                print(f"Неожиданный статус-код: {response.status_code}")
+                print(f"Содержимое ответа: {response.text[:500]}...")
+                raise Exception(f"Сервер вернул статус-код {response.status_code}")
+
+        except requests.exceptions.Timeout:
+            print(f"Таймаут запроса ({current_timeout} сек). Повторная попытка...")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+                continue
+            else:
+                raise Exception(f"Таймаут запроса после {max_retries} попыток")
+        except requests.exceptions.RequestException as e:
+            print(f"Ошибка запроса: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+                continue
+            else:
+                raise
+
+
+def send_to_openrouter(titles_text):
+    """
+    Отправляет заголовки в OpenRouter API и возвращает ответ
+    """
+    print("\n📤 Отправка заголовков в OpenRouter API...")
+
+    # Формируем промпт с заголовками
+    prompt = f"Проанализируй следующие заголовки новостей верни один короткий поисковый запрос состоящий 3-6 слов для поиска иллюстраций к новости. Выбери такой запрос который наилучшим образом описывает тему. Правила:Ответ — только фраза без объяснений, без знаков препинания, запрещено писать несколько вариантов. Если новости про человека, событие, проишествие, город любой другой объект — обязательно включи его имя если оно есть. Не пиши эмоциональные однословные ответы:  \n\n{titles_text}"
+
+    # Формируем payload для OpenRouter API
+    payload = {
+        "model": "z-ai/glm-4.5-air:free",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+
+    try:
+        # Отправляем запрос
+        response = requests.post(OPENROUTER_API_URL, json=payload, headers=OPENROUTER_HEADERS, timeout=120)
+
+        if response.status_code == 200:
+            response_data = response.json()
+            # Извлекаем ответ модели
+            model_response = response_data['choices'][0]['message']['content']
+
+            # Сохраняем ответ в файл (для справки)
+            output_file = os.path.join(output_folder, "openrouter_analysis.txt")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(model_response)
+
+            print(f"✅ Ответ от OpenRouter: {model_response}")
+            return model_response
+        else:
+            print(f"❌ Ошибка при запросе к OpenRouter API: {response.status_code}")
+            print(f"Ответ: {response.text}")
+            return None
+
+    except Exception as e:
+        print(f"❌ Исключение при запросе к OpenRouter API: {e}")
+        return None
+
+
+def get_file_extension(url, headers):
+    """
+    Определяет расширение файла на основе URL или HTTP-заголовков.
+    """
+    # 1. Пытаемся получить расширение из URL
+    path = urlparse(url).path
+    ext = os.path.splitext(path)[1]
+    if ext:
+        return ext
+
+    # 2. Если в URL расширения нет, смотрим на заголовок Content-Type
+    content_type = headers.get('Content-Type', '')
+    if not content_type:
+        return '.jpg'  # Возврат к значению по умолчанию, если заголовок отсутствует
+
+    # Очищаем Content-Type от возможных параметров (например, "; charset=utf-8")
+    mime_type = content_type.split(';')[0].strip().lower()
+
+    # Словарь для сопоставления MIME-типов и расширений
+    mime_to_ext = {
+        'image/jpeg': '.jpg',
+        'image/png': '.png',
+        'image/gif': '.gif',
+        'image/webp': '.webp',
+        'image/svg+xml': '.svg',
+        'image/bmp': '.bmp',
+        'image/tiff': '.tiff'
+    }
+
+    return mime_to_ext.get(mime_type, '.jpg')  # Возврат к .jpg, если тип неизвестен
+
+
+def search_and_download_images(search_query):
+    """
+    Ищет и скачивает изображения по заданному запросу
+    """
+    # Формируем URL для поиска изображений в Яндексе
+    yandex_images_url = f"https://yandex.ru/images/search?from=tabbar&text={quote_plus(search_query)}&recent=7D&iorient=horizontal"
+    print(f"\n🔍 Поиск изображений по запросу: '{search_query}'")
+
+    # Настройка опций Chrome
+    chrome_options = Options()
+    chrome_options.binary_location = chrome_path
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+
+    service = Service(executable_path=chromedriver_path)
+    driver = None
+
+    try:
+        # Инициализация драйвера
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        print("Переход на страницу поиска изображений...")
+        driver.get(yandex_images_url)
+
+        # Ожидание загрузки контейнера с изображениями
+        print("Ожидание загрузки контейнера с изображениями...")
+        wait = WebDriverWait(driver, 20)  # Увеличим время ожидания до 20 секунд
+        # Ждем появления первого ряда с изображениями
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'div.JustifierRowLayout-Row[data-pos="0"]')))
+        print("Контейнер загружен. Поиск изображений...")
+
+        # Поиск всех тегов img с нужным классом
+        image_elements = driver.find_elements(By.CSS_SELECTOR, 'img.ImagesContentImage-Image')
+
+        if not image_elements:
+            print("Изображения не найдены на странице.")
+            return []
+
+        downloaded_images = []
+        # Обрабатываем только первые 3 изображения
+        for i, img_element in enumerate(image_elements[:3]):
+            try:
+                # Получаем URL изображения из атрибута 'src'
+                img_src = img_element.get_attribute('src')
+
+                # URL в Яндексе часто начинается с '//', нужно добавить 'https:'
+                if img_src and img_src.startswith('//'):
+                    img_url = 'https:' + img_src
+                else:
+                    img_url = img_src
+
+                if not img_url:
+                    print(f"Не удалось получить URL для изображения {i + 1}.")
+                    continue
+
+                print(f"Найден URL изображения {i + 1}: {img_url}")
+
+                # Скачивание изображения
+                print(f"Скачивание изображения {i + 1}...")
+                response = requests.get(img_url, stream=True, timeout=10)
+                response.raise_for_status()  # Проверка на ошибки HTTP (4xx или 5xx)
+
+                # Определяем расширение файла с помощью нашей функции
+                file_extension = get_file_extension(img_url, response.headers)
+                print(f"Определено расширение: {file_extension}")
+
+                # Генерация уникального имени файла с UUID
+                filename = f"{uuid.uuid4()}{file_extension}"
+                file_path = os.path.join(output_folder, filename)
+
+                # Сохранение файла
+                with open(file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                print(f"Изображение {i + 1} успешно сохранено как: {file_path}")
+                downloaded_images.append(file_path)
+
+            except requests.exceptions.RequestException as e:
+                print(f"Ошибка при скачивании изображения {i + 1}: {e}")
+            except Exception as e:
+                print(f"Произошла непредвиденная ошибка при обработке изображения {i + 1}: {e}")
+
+        return downloaded_images
+
+    except TimeoutException:
+        print("Ошибка: Элементы на странице не загрузились за отведенное время.")
+        return []
+    except Exception as e:
+        print(f"Произошла общая ошибка при поиске изображений: {e}")
+        return []
+    finally:
+        # Закрытие браузера
+        if driver:
+            print("Завершение работы с поиском изображений, закрытие браузера.")
+            driver.quit()
+
+
+def process_search_results_page(driver, page_number, titles_list, summaries_list):
+    """
+    Находит все результаты на текущей странице, переходит по ссылкам,
+    очищает их, отправляет текст на API и добавляет результат в список.
+    Также собирает заголовки в переданный список.
+    """
+    print(f"\n===== НАЧАЛО ОБРАБОТКИ СТРАНИЦЫ {page_number} =====")
+
+    # Даем странице время на полную загрузку результатов
+    time.sleep(3)
+
+    # Находим все блоки с результатами
+    search_results = driver.find_elements(By.CSS_SELECTOR, "div.SoaBEf")
+
+    if not search_results:
+        print(f"На странице {page_number} не найдено результатов поиска.")
+        return
+
+    # Сохраняем ID текущей (основной) вкладки
+    original_window = driver.current_window_handle
+
+    for i, result in enumerate(search_results):
+        # Инициализируем переменные, чтобы они были доступны в finally
+        source = "неизвестный_источник"
+        link = "неизвестная_ссылка"
+
+        try:
+            # Извлекаем данные
+            title_element = result.find_element(By.CSS_SELECTOR, "div.n0jPhd.ynAwRc.MBeuO.nDgy9d")
+            title = title_element.text
+
+            # Добавляем заголовок в список
+            titles_list.append(title)
+
+            link_element = result.find_element(By.CSS_SELECTOR, "a.WlydOe")
+            link = link_element.get_attribute("href")
+
+            source_element = result.find_element(By.CSS_SELECTOR, "div.MgUUmf.NUnG9d span")
+            source = source_element.text
+
+            print(f"\n--- Страница {page_number} | Результат {i + 1}/{len(search_results)}: {source} ---")
+            print(f"Заголовок: {title}")
+            print(f"Переход по ссылке: {link}")
+
+            # Открываем ссылку в новой вкладке
+            driver.switch_to.new_window('tab')
+            driver.get(link)
+
+            # --- Очистка страницы ---
+            js_script = """
+                var elements_to_remove = document.querySelectorAll('script, img, a, button, input, footer');
+                for (var i = elements_to_remove.length - 1; i >= 0; i--) {
+                    elements_to_remove[i].parentNode.removeChild(elements_to_remove[i]);
+                }
+            """
+            driver.execute_script(js_script)
+            print("✅ Страница очищена от лишних элементов.")
+
+            # --- Извлечение данных ---
+            body_element = driver.find_element(By.TAG_NAME, 'body')
+            cleaned_html = body_element.get_attribute('innerHTML')
+            cleaned_text = body_element.text
+
+            if not cleaned_text.strip():
+                print("⚠️ На странице не найден текст для отправки. Пропускаем.")
+                continue
+
+            # --- ГЕНЕРАЦИЯ ПУТЕЙ К ФАЙЛАМ (ДЕЛАЕМ ЭТО ЗДЕСЬ) ---
+            base_name = re.sub(r'[\\/*?:"<>|]', "", source)
+            html_filepath = os.path.join(output_folder, f"{base_name}.html")
+            # НОВОЕ: Создаем путь для файла с исходным текстом
+            original_txt_filepath = os.path.join(output_folder, f"{base_name}_original.txt")
+
+            # --- СРАЗУ СОХРАНЯЕМ HTML-ФАЙЛ ---
+            with open(html_filepath, 'w', encoding='utf-8') as f:
+                f.write(cleaned_html)
+            print(f"✅ Очищенная страница (HTML) сохранена в файл: {html_filepath}")
+
+            # --- НОВОЕ: СОХРАНЯЕМ ИСХОДНЫЙ ТЕКСТ ---
+            with open(original_txt_filepath, 'w', encoding='utf-8') as f:
+                f.write(cleaned_text)
+            print(f"✅ Исходный текст для суммаризации сохранен в файл: {original_txt_filepath}")
+
+            # --- Отправка текста на API и получение ответа ---
+            try:
+                print("📤 Отправка текста на API для суммаризации...")
+
+                # Очищаем текст перед отправкой
+                cleaned_text_for_api = clean_text_for_json(cleaned_text)
+                payload = {'content': cleaned_text_for_api}
+
+                print(f"Отправка запроса на {API_URL} методом POST")
+                # Не выводим полный payload в консоль, так как он может быть очень большим
+                print(f"Длина данных для отправки: {len(str(payload))} символов")
+
+                # Используем новую функцию с повторными попытками
+                response_data = send_request_with_retries(API_URL, payload, API_HEADERS)
+                print("✅ Ответ от API успешно получен и распарсен.")
+
+                # Проверяем, нет ли ошибки в ответе от нашего PHP-прокси
+                if 'error' in response_data:
+                    error_message = response_data['error']
+                    print(f"❌ API вернуло ошибку: {error_message}")
+                    summary_text = f"Ошибка API: {error_message}"
+                else:
+                    # Если ошибки нет, безопасно извлекаем итоговый текст
+                    try:
+                        summary_text = response_data['message']['content']
+                    except (KeyError, TypeError):
+                        print("❌ Не удалось извлечь 'content' из ответа API. Сохраняем полный ответ для отладки.")
+                        summary_text = "Не удалось извлечь контент. Полный ответ:\n" + str(response_data)
+
+                # --- НОВОЕ: Добавляем только текст суммаризации в список ---
+                summaries_list.append(summary_text)
+                print(f"✅ Результат суммаризации добавлен в список. Всего в списке: {len(summaries_list)}")
+
+            except Exception as e:
+                print(f"❌ Произошла ошибка при обработке API: {e}")
+                # Добавляем информацию об ошибке в список
+                summaries_list.append(f"Не удалось обработать текст из-за ошибки сети/API: {e}")
+
+        except TimeoutException:
+            print(f"⏰ Сайт {link} не загрузился за 10 секунд. Пропускаем.")
+        except Exception as e:
+            print(f"❌ Произошла ошибка при обработке ссылки {link}: {e}")
+        finally:
+            # Возвращаемся на основную вкладку и закрываем текущую
+            if len(driver.window_handles) > 1:
+                driver.close()
+            driver.switch_to.window(original_window)
+            time.sleep(1)  # Небольшая пауза между запросами
+
+    print(f"\n===== ЗАВЕРШЕНА ОБРАБОТКА СТРАНИЦЫ {page_number} =====")
+
+
+def post_results_to_api(keyword, keyword_uuid, summaries_list, downloaded_images):
+    """
+    Отправляет результаты поиска на API после проверки условий
+    """
+    print("\n📤 Подготовка к отправке результатов на API...")
+
+    # Объединяем все тексты суммаризации в один блок
+    combined_text = "\n\n".join(summaries_list)
+
+    # --- ВАЛИДАЦИЯ ПЕРЕД ОТПРАВКОЙ ---
+
+    # 1. Проверяем, что текст не пустой
+    if not combined_text.strip():
+        print("❌ Текст для отправки пуст. Отправка отменена.")
+        return False
+
+    # 2. Проверяем длину текста (более 300 символов)
+    if len(combined_text) <= 300:
+        print(f"❌ Текст для отправки слишком короткий ({len(combined_text)} символов). Требуется более 300 символов. Отправка отменена.")
+        return False
+
+    # 3. Проверяем количество изображений (более 1)
+    if len(downloaded_images) < 1:
+        print(f"❌ Недостаточно изображений для отправки ({len(downloaded_images)} шт.). Требуется хотя бы 1 изображение. Отправка отменена.")
+        return False
+
+    print("✅ Валидация пройдена. Текст > 300 символов, изображения >= 1. Продолжаем отправку.")
+
+    # --- Ограничиваем текст до 16000 символов ---
+    if len(combined_text) > 16000:
+        print(f"⚠️ Текст превышает 16000 символов ({len(combined_text)}). Обрезаем.")
+        # Простая обрезка до 16000 символов
+        combined_text = combined_text[:16000]
+        print(f"✅ Текст обрезан до {len(combined_text)} символов.")
+
+    headers = {
+        'Authorization': f'Bearer {TOKEN}'
+    }
+
+    # Подготавливаем данные для отправки
+    data = {
+        'keyword_uuid': keyword_uuid,
+        'title': keyword,
+        'text': combined_text
+    }
+
+    # Подготавливаем файлы для отправки
+    files = {}
+
+    # Добавляем изображения
+    for i, img_path in enumerate(downloaded_images):
+        if os.path.exists(img_path):
+            files[f'attachments[{i}]'] = (os.path.basename(img_path), open(img_path, 'rb'), 'image/jpeg')
+        else:
+            print(f"⚠️ Файл изображения не найден: {img_path}")
+
+    try:
+        print(f"Отправка данных на {API_POST_RESULTS}...")
+        print(f"Длина текста: {len(combined_text)} символов")
+        print(f"Количество изображений: {len(downloaded_images)}")
+
+        response = requests.post(API_POST_RESULTS, data=data, files=files, headers=headers, timeout=120)
+
+        # Закрываем все открытые файлы
+        for file_obj in files.values():
+            if hasattr(file_obj[1], 'close'):
+                file_obj[1].close()
+
+        if response.status_code == 200 or response.status_code == 201:
+            response_data = response.json()
+            print("✅ Результаты успешно отправлены на API")
+            print(f"Ответ сервера: {response_data}")
+            return True
+        else:
+            print(f"❌ Ошибка при отправке результатов на API: {response.status_code}")
+            print(f"Ответ: {response.text}")
+            return False
+
+    except Exception as e:
+        print(f"❌ Исключение при отправке результатов на API: {e}")
+        # Закрываем все открытые файлы в случае исключения
+        for file_obj in files.values():
+            if hasattr(file_obj[1], 'close'):
+                file_obj[1].close()
+        return False
+
+
+# --- ОСНОВНАЯ ЛОГИКА ---
+
+# Получаем ключевое слово и UUID из API
+keyword, keyword_uuid = get_keyword_from_api()
+
+if not keyword or not keyword_uuid:
+    print("❌ Не удалось получить ключевое слово или UUID. Завершение работу.")
+    exit(1)
+
+# --- ИЗМЕНЕНИЕ: Создаем папку с именем UUID ---
+output_folder = keyword_uuid
+os.makedirs(output_folder, exist_ok=True)
+print(f"📁 Папка для сохранения файлов: {output_folder}")
+
+# Формируем URL для поиска с полученным ключевым словом
+search_url = url_template.format(keyword=quote_plus(keyword))
+print(f"🔍 URL для поиска: {search_url}")
+
+# Настройка опций Chrome
+chrome_options = Options()
+chrome_options.add_argument("--start-maximized")
+chrome_options.binary_location = chrome_path
+
+# Создание сервиса и запуск браузера
+service = Service(executable_path=chromedriver_path)
+driver = webdriver.Chrome(service=service, options=chrome_options)
+
+# Устанавливаем тайм-аут загрузки страницы в 20 секунд
+driver.set_page_load_timeout(20)
+
+# Создаем списки для хранения заголовков и результатов суммаризации
+titles_list = []
+summaries_list = []
+downloaded_images = []
+
+try:
+    # --- Обработка страниц ---
+    driver.get(search_url)
+    process_search_results_page(driver, page_number=1, titles_list=titles_list, summaries_list=summaries_list)
+
+    # --- Обработка дополнительных страниц, если необходимо ---
+    for page_num in range(2, GOOGLE_PAGES_TO_PARSE + 1):
+        try:
+            print(f"\nПроверяем наличие страницы {page_num}...")
+            # Ищем ссылку на нужную страницу
+            page_link_element = driver.find_element(By.CSS_SELECTOR, f'a[aria-label="Page {page_num}"]')
+
+            if page_link_element:
+                print(f"Ссылка на страницу {page_num} найдена. Переход...")
+                page_link_element.click()
+
+                # Обрабатываем страницу
+                process_search_results_page(driver, page_number=page_num, titles_list=titles_list, summaries_list=summaries_list)
+            else:
+                print(f"Ссылка на страницу {page_num} не найдена. Прекращаем поиск дополнительных страниц.")
+                break
+
+        except NoSuchElementException:
+            print(f"Ссылка на страницу {page_num} не найдена. Прекращаем поиск дополнительных страниц.")
+            break
+
+    # --- Сохранение результатов суммаризации в файл ---
+    if summaries_list:
+        print(f"\nВсего результатов суммаризации: {len(summaries_list)}")
+
+        # Объединяем все тексты суммаризации в один блок
+        combined_text = "\n\n".join(summaries_list)
+
+        # Сохраняем объединенный текст в файл
+        summaries_file = os.path.join(output_folder, "all_summaries.json")
+        with open(summaries_file, 'w', encoding='utf-8') as f:
+            json.dump({"text": combined_text}, f, ensure_ascii=False, indent=2)
+        print(f"✅ Объединенный текст суммаризации сохранен в файл: {summaries_file}")
+
+    # --- Отправка заголовков в OpenRouter ---
+    if titles_list:
+        print(f"\nВсего собрано заголовков: {len(titles_list)}")
+
+        # Объединяем заголовки в один текст
+        titles_text = "\n".join(titles_list)
+
+        # Отправляем в OpenRouter API и получаем поисковый запрос
+        search_query = send_to_openrouter(titles_text)
+
+        # Если получили поисковый запрос, ищем и скачиваем изображения
+        if search_query:
+            # Небольшая пауза перед закрытием текущего браузера и открытием нового
+            time.sleep(3)
+
+            # Закрываем текущий браузер
+            driver.quit()
+
+            # Ищем и скачиваем изображения по полученному запросу
+            downloaded_images = search_and_download_images(search_query)
+
+            # Сохраняем информацию о скачанных изображениях
+            if downloaded_images:
+                images_info_file = os.path.join(output_folder, "downloaded_images.txt")
+                with open(images_info_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Поисковый запрос: {search_query}\n\n")
+                    for i, img_path in enumerate(downloaded_images, 1):
+                        f.write(f"Изображение {i}: {img_path}\n")
+                print(f"✅ Информация о скачанных изображениях сохранена в файл: {images_info_file}")
+        else:
+            print("⚠️ Не удалось получить поисковый запрос от OpenRouter.")
+    else:
+        print("⚠️ Не удалось собрать заголовки для отправки в OpenRouter.")
+
+    # --- Отправка результатов на API ---
+    if summaries_list:
+        post_results_to_api(keyword, keyword_uuid, summaries_list, downloaded_images)
+
+except Exception as e:
+    print(f"Произошла общая ошибка: {e}")
+finally:
+    # Закрываем браузер после завершения работы (если он еще открыт)
+    try:
+        if driver:
+            print("\nРабота завершена. Браузер закрывается.")
+            driver.quit()
+    except:
+        pass
